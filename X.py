@@ -50,56 +50,40 @@ def get_osrm_route(origin, destination):
 def route_optimization(manufacturing_site, destination_hospital):
     G = nx.DiGraph()
     direct_road_distance, direct_road_geometry = get_osrm_route(manufacturing_site, destination_hospital)
-    print(f"distance {direct_road_distance} geometry {direct_road_geometry}" )
     if direct_road_distance < 200:
-        print("less than 50s")
         G.add_edge(f'{manufacturing_site[2]}', f'{destination_hospital[2]}', weight=direct_road_distance, geometry=direct_road_geometry)
-        print(G)
     else:
-        closest_transport = get_closest((manufacturing_site[0], manufacturing_site[1]),(destination_hospital[0], destination_hospital[1]),  Flight.objects.all())
+        closest_transport = get_closest((manufacturing_site[0], manufacturing_site[1]), (destination_hospital[0], destination_hospital[1]), Flight.objects.all())
         road_distance_to_transport, road_geometry_to_transport = get_osrm_route(manufacturing_site, (closest_transport.departure_latitude, closest_transport.departure_longitude))
-        G.add_edge(f'{manufacturing_site[2]}', closest_transport, weight=road_distance_to_transport, geometry=road_geometry_to_transport)
+        G.add_edge(f'{manufacturing_site[2]}', f'{closest_transport.flight_id}', weight=road_distance_to_transport, geometry=road_geometry_to_transport)
         
-        # closest_transport_to_hospital = get_closest(destination_hospital, Flight.objects.all())
         air_distance = geodesic((closest_transport.departure_latitude, closest_transport.departure_longitude), (closest_transport.arrival_latitude, closest_transport.arrival_longitude)).km
-        G.add_edge(closest_transport, closest_transport, weight=air_distance, geometry=None)
+        G.add_edge(f'{closest_transport.flight_id}', f'{closest_transport.flight_id}', weight=air_distance, geometry=None)
         
         road_distance_to_hospital, road_geometry_to_hospital = get_osrm_route((closest_transport.arrival_latitude, closest_transport.arrival_longitude), destination_hospital)
-        G.add_edge(closest_transport, f'{destination_hospital[2]}', weight=road_distance_to_hospital, geometry=road_geometry_to_hospital)
+        G.add_edge(f'{closest_transport.flight_id}', f'{destination_hospital[2]}', weight=road_distance_to_hospital, geometry=road_geometry_to_hospital)
     
     shortest_path = nx.shortest_path(G, source=f'{manufacturing_site[2]}', target=f'{destination_hospital[2]}', weight='weight', method='dijkstra')
-    print(f"shortest path:{shortest_path}")
     total_distance = nx.shortest_path_length(G, source=f'{manufacturing_site[2]}', target=f'{destination_hospital[2]}', weight='weight', method='dijkstra')
     edge_geometries = nx.get_edge_attributes(G, 'geometry')
-    print("total distance:", total_distance)
-    print("total edge_geometries:", edge_geometries)
     return shortest_path, total_distance, edge_geometries
-
 
 def plot_route(manufacturing_site, destination_hospital, shortest_path, edge_geometries, total_distance):
     mid_lat = (manufacturing_site[0] + destination_hospital[0]) / 2
     mid_lon = (manufacturing_site[1] + destination_hospital[1]) / 2
     m = folium.Map(location=[mid_lat, mid_lon], zoom_start=3)
-    print("mid Lat", mid_lat)
-    # Add markers for manufacturing site and hospital
+    
     folium.Marker(location=(manufacturing_site[0], manufacturing_site[1]), popup=f'{manufacturing_site[2]}', icon=folium.Icon(color='blue')).add_to(m)
     folium.Marker(location=(destination_hospital[0], destination_hospital[1]), popup=f'{destination_hospital[2]}', icon=folium.Icon(color='red')).add_to(m)
     
-    # Find transportation nodes along the route
-    transportation_nodes = [node for node in shortest_path if isinstance(node, Flight)]
-    print("nodes:",transportation_nodes)
-    # Display flight ID only for the first and last transportation nodes (start and end of the route)
-    if len(transportation_nodes) >= 1:
-        start_transport = transportation_nodes[0]
-        print("start node:",start_transport)
-        # end_transport = transportation_nodes[-1]
-        
-        folium.Marker(location=(start_transport.departure_latitude, start_transport.departure_longitude), popup=f"Flight ID: {start_transport.flight_id}", icon=folium.Icon(color='green')).add_to(m)
-        folium.Marker(location=(start_transport.arrival_latitude, start_transport.arrival_longitude), popup=f"Flight ID: {start_transport.flight_id}", icon=folium.Icon(color='green')).add_to(m)
-        folium.PolyLine(locations=[(start_transport.departure_latitude, start_transport.departure_longitude),(start_transport.arrival_latitude, start_transport.arrival_longitude)], color='blue', weight=2.5, opacity=1, popup=f"{total_distance} km").add_to(m)
+    transportation_nodes = [node for node in shortest_path if isinstance(node, str) and node.startswith('Flight ID')]
+    
+    for node in transportation_nodes:
+        flight = Flight.objects.get(flight_id=node)
+        folium.Marker(location=(flight.departure_latitude, flight.departure_longitude), popup=f"Flight ID: {flight.flight_id}", icon=folium.Icon(color='green')).add_to(m)
+        folium.Marker(location=(flight.arrival_latitude, flight.arrival_longitude), popup=f"Flight ID: {flight.flight_id}", icon=folium.Icon(color='green')).add_to(m)
+        folium.PolyLine(locations=[(flight.departure_latitude, flight.departure_longitude), (flight.arrival_latitude, flight.arrival_longitude)], color='blue', weight=2.5, opacity=1, popup=f"{total_distance} km").add_to(m)
 
-    # Plot polylines for the shortest path
-    print("shortest Path:", shortest_path)
     for i in range(len(shortest_path) - 1):
         start = shortest_path[i]
         end = shortest_path[i + 1]
@@ -109,14 +93,14 @@ def plot_route(manufacturing_site, destination_hospital, shortest_path, edge_geo
         elif start == f'{destination_hospital[2]}':
             start_coords = (destination_hospital[0], destination_hospital[1])
         else:
-            start_coords = (start.departure_latitude, start.departure_longitude)
+            start_coords = (Flight.objects.get(flight_id=start).departure_latitude, Flight.objects.get(flight_id=start).departure_longitude)
         
         if end == f'{manufacturing_site[2]}':
-            end_coords =  (manufacturing_site[0], manufacturing_site[1])
+            end_coords = (manufacturing_site[0], manufacturing_site[1])
         elif end == f'{destination_hospital[2]}':
             end_coords = (destination_hospital[0], destination_hospital[1])
         else:
-            end_coords = (end.departure_latitude, end.departure_longitude)
+            end_coords = (Flight.objects.get(flight_id=end).departure_latitude, Flight.objects.get(flight_id=end).departure_longitude)
         
         if (start, end) in edge_geometries and edge_geometries[(start, end)]:
             coordinates = polyline.decode(edge_geometries[(start, end)])
