@@ -1,112 +1,185 @@
-import networkx as nx
-from geopy.distance import geodesic
-import requests
-import polyline
-import folium
-from .models import Flight, Truck
-from manufacture.models import Manufacture
+from .serializers import OrderSerializer, GetOrderSerializer
+from .models import Order
+from rest_framework import viewsets
+from django.http import HttpResponse
+from django.http import JsonResponse  
+import pandas as pd  
+from rest_framework import views
+from rest_framework.response import Response
+from .utils import get_forecast_data
+from .serializers import ForecastSerializer
+from manufacture.models import Manufacture, Drug
 from hospital.models import Hospital
+from pulp import LpMinimize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD
+import math
+import json
+from rest_framework import status
+from datetime import timedelta, datetime
+import folium
+from rest_framework import generics
+from django_filters import rest_framework as filters
+from datetime import datetime
 
-def get_closest(origin, destination, points):
-    closest_to_origin = None
-    min_distance_to_origin = float('inf')
-    
-    for point in points:
-        departure_coords = (point.departure_latitude, point.departure_longitude)
-        manufacture_to_airport_distance = geodesic(origin, departure_coords).km
-        
-        if manufacture_to_airport_distance < min_distance_to_origin:
-            min_distance_to_origin = manufacture_to_airport_distance
-            closest_to_origin = point
-    
-    closest_to_destination = None
-    min_distance_to_destination = float('inf')
-    
-    for point in points:
-        if point.departure_latitude == closest_to_origin.departure_latitude and point.departure_longitude == closest_to_origin.departure_longitude:
-            arrival_coords = (point.arrival_latitude, point.arrival_longitude)
-            airport_to_hospital_distance = geodesic(destination, arrival_coords).km
-            
-            if airport_to_hospital_distance < min_distance_to_destination:
-                min_distance_to_destination = airport_to_hospital_distance
-                closest_to_destination = point
-    
-    return closest_to_destination
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
 
-def get_osrm_route(origin, destination):
-    base_url = 'http://router.project-osrm.org/route/v1/driving/'
-    origin_str = f"{origin[1]},{origin[0]}"  
-    destination_str = f"{destination[1]},{destination[0]}"  
-    url = f"{base_url}{origin_str};{destination_str}?overview=full"
-    response = requests.get(url)
-    data = response.json()
-    if data['code'] == 'Ok':
-        distance = data['routes'][0]['distance'] / 1000  # distance in km
-        route_geometry = data['routes'][0]['geometry']
-        return distance, route_geometry
-    else:
-        raise Exception(f"Error fetching route from OSRM: {data['code']}")
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
 
-def route_optimization(manufacturing_site, destination_hospital):
-    G = nx.DiGraph()
-    direct_road_distance, direct_road_geometry = get_osrm_route(manufacturing_site, destination_hospital)
-    if direct_road_distance < 200:
-        G.add_edge(f'{manufacturing_site[2]}', f'{destination_hospital[2]}', weight=direct_road_distance, geometry=direct_road_geometry)
-    else:
-        closest_transport = get_closest((manufacturing_site[0], manufacturing_site[1]), (destination_hospital[0], destination_hospital[1]), Flight.objects.all())
-        road_distance_to_transport, road_geometry_to_transport = get_osrm_route(manufacturing_site, (closest_transport.departure_latitude, closest_transport.departure_longitude))
-        G.add_edge(f'{manufacturing_site[2]}', f'{closest_transport.flight_id}', weight=road_distance_to_transport, geometry=road_geometry_to_transport)
-        
-        air_distance = geodesic((closest_transport.departure_latitude, closest_transport.departure_longitude), (closest_transport.arrival_latitude, closest_transport.arrival_longitude)).km
-        G.add_edge(f'{closest_transport.flight_id}', f'{closest_transport.flight_id}', weight=air_distance, geometry=None)
-        
-        road_distance_to_hospital, road_geometry_to_hospital = get_osrm_route((closest_transport.arrival_latitude, closest_transport.arrival_longitude), destination_hospital)
-        G.add_edge(f'{closest_transport.flight_id}', f'{destination_hospital[2]}', weight=road_distance_to_hospital, geometry=road_geometry_to_hospital)
-    
-    shortest_path = nx.shortest_path(G, source=f'{manufacturing_site[2]}', target=f'{destination_hospital[2]}', weight='weight', method='dijkstra')
-    total_distance = nx.shortest_path_length(G, source=f'{manufacturing_site[2]}', target=f'{destination_hospital[2]}', weight='weight', method='dijkstra')
-    edge_geometries = nx.get_edge_attributes(G, 'geometry')
-    return shortest_path, total_distance, edge_geometries
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-def plot_route(manufacturing_site, destination_hospital, shortest_path, edge_geometries, total_distance):
-    mid_lat = (manufacturing_site[0] + destination_hospital[0]) / 2
-    mid_lon = (manufacturing_site[1] + destination_hospital[1]) / 2
-    m = folium.Map(location=[mid_lat, mid_lon], zoom_start=3)
-    
-    folium.Marker(location=(manufacturing_site[0], manufacturing_site[1]), popup=f'{manufacturing_site[2]}', icon=folium.Icon(color='blue')).add_to(m)
-    folium.Marker(location=(destination_hospital[0], destination_hospital[1]), popup=f'{destination_hospital[2]}', icon=folium.Icon(color='red')).add_to(m)
-    
-    transportation_nodes = [node for node in shortest_path if isinstance(node, str) and node.startswith('Flight ID')]
-    
-    for node in transportation_nodes:
-        flight = Flight.objects.get(flight_id=node)
-        folium.Marker(location=(flight.departure_latitude, flight.departure_longitude), popup=f"Flight ID: {flight.flight_id}", icon=folium.Icon(color='green')).add_to(m)
-        folium.Marker(location=(flight.arrival_latitude, flight.arrival_longitude), popup=f"Flight ID: {flight.flight_id}", icon=folium.Icon(color='green')).add_to(m)
-        folium.PolyLine(locations=[(flight.departure_latitude, flight.departure_longitude), (flight.arrival_latitude, flight.arrival_longitude)], color='blue', weight=2.5, opacity=1, popup=f"{total_distance} km").add_to(m)
+    distance = R * c
+    return distance
 
-    for i in range(len(shortest_path) - 1):
-        start = shortest_path[i]
-        end = shortest_path[i + 1]
-        
-        if start == f'{manufacturing_site[2]}':
-            start_coords = (manufacturing_site[0], manufacturing_site[1])
-        elif start == f'{destination_hospital[2]}':
-            start_coords = (destination_hospital[0], destination_hospital[1])
-        else:
-            start_coords = (Flight.objects.get(flight_id=start).departure_latitude, Flight.objects.get(flight_id=start).departure_longitude)
-        
-        if end == f'{manufacturing_site[2]}':
-            end_coords = (manufacturing_site[0], manufacturing_site[1])
-        elif end == f'{destination_hospital[2]}':
-            end_coords = (destination_hospital[0], destination_hospital[1])
-        else:
-            end_coords = (Flight.objects.get(flight_id=end).departure_latitude, Flight.objects.get(flight_id=end).departure_longitude)
-        
-        if (start, end) in edge_geometries and edge_geometries[(start, end)]:
-            coordinates = polyline.decode(edge_geometries[(start, end)])
-            folium.PolyLine(locations=coordinates, color='blue', weight=2.5, opacity=1, popup=f"{total_distance} km").add_to(m)
-        else:
-            coordinates = [(start_coords[0], start_coords[1]), (end_coords[0], end_coords[1])]
-            folium.PolyLine(locations=coordinates, color='blue', weight=2.5, opacity=1, popup=f"{total_distance} km").add_to(m)
+# Function to collect data from Django models
+def collect_data():
+    orders = Order.objects.all().values()
+    hospitals = Hospital.objects.all().values()
+    manufacturing_sites = Manufacture.objects.all().values()
+    orders_df = pd.DataFrame(orders)
+    hospital_df = pd.DataFrame(hospitals)
+    manufacture_df = pd.DataFrame(manufacturing_sites)
+    return orders_df, hospital_df, manufacture_df
+
+def filter_orders_by_week(orders_df, start_date):
+    # Convert start_date to pandas datetime
+    start_date = pd.to_datetime(start_date)
+    end_date = start_date + timedelta(days=7)
+    # Ensure delivery_date is in datetime format
+    orders_df['delivery_date'] = pd.to_datetime(orders_df['delivery_date'])
+    return orders_df[(orders_df['delivery_date'] >= start_date) & (orders_df['delivery_date'] < end_date)]
+
+def allocate_orders(request):
+    # Collect data
+    orders_df, hospital_df, manufacture_df = collect_data()
+
+    # Specify the week start date (Monday)
+    start_date = request.GET.get('start_date')
     
-    return m._repr_html_()
+    # Filter orders for the specified week
+    weekly_orders_df = filter_orders_by_week(orders_df, start_date)
+    
+    # Prepare data for linear programming model
+    manufacturing_sites = {}
+    for _, row in manufacture_df.iterrows():
+        manufacturing_sites[row['site_id']] = {
+            "location": (row['latitude'], row['longitude']),
+            "production_capacity": row['production_capacity']
+        }
+    hospitals = {}
+    for _, row in hospital_df.iterrows():
+        hospitals[row['hospital_id']] = {
+            "location": (row['hospital_latitude'], row['hospital_longitude']),
+            "demand": weekly_orders_df[weekly_orders_df['hospital_id'] == row['hospital_id']]['quantity'].sum()
+        }
+
+    # Cost calculation (assuming cost per kilometer is $1)
+    cost_per_km = 1
+
+    # Calculate the cost matrix C_ij
+    cost_matrix = {}
+    for ms_id, ms_data in manufacturing_sites.items():
+        cost_matrix[ms_id] = {}
+        for h_id, h_data in hospitals.items():
+            distance = haversine(ms_data["location"][0], ms_data["location"][1], h_data["location"][0], h_data["location"][1])
+            cost_matrix[ms_id][h_id] = cost_per_km * distance
+
+    # Define the linear programming problem
+    prob = LpProblem("Drug_Allocation_Problem", LpMinimize)
+
+    # Define the decision variables
+    x = LpVariable.dicts("X", (manufacturing_sites.keys(), hospitals.keys()), lowBound=0, cat='Continuous')
+
+    # Objective function: Minimize the total cost of shipping
+    prob += lpSum([x[ms_id][h_id] * cost_matrix[ms_id][h_id] for ms_id in manufacturing_sites for h_id in hospitals]), "Total_Transportation_Cost"
+
+    # Constraints
+    # All demand must be fulfilled
+    for h_id in hospitals:
+        prob += lpSum([x[ms_id][h_id] for ms_id in manufacturing_sites]) == hospitals[h_id]["demand"], f"Demand_{h_id}"
+
+    # Production capacity constraint
+    for ms_id in manufacturing_sites:
+        prob += lpSum([x[ms_id][h_id] for h_id in hospitals]) <= manufacturing_sites[ms_id]["production_capacity"], f"Capacity_{ms_id}"
+
+    # Solve the problem
+    prob.solve(PULP_CBC_CMD(msg=0))
+
+    # Output the results in JSON format
+    total_cost = prob.objective.value()
+    
+    # Collect allocations respecting production capacities
+    allocations = {}
+    for h_id in hospitals:
+        for ms_id in manufacturing_sites:
+            quantity = x[ms_id][h_id].varValue
+            if quantity > 0:
+                if ms_id not in allocations:
+                    allocations[ms_id] = {}
+                allocations[ms_id][h_id] = quantity
+
+    # Final allocation adjustment to respect production capacities
+    final_allocations = {}
+    for ms_id in allocations:
+        final_allocations[ms_id] = {}
+        total_allocated = 0
+        for h_id in sorted(allocations[ms_id], key=lambda h: cost_matrix[ms_id][h]):
+            if total_allocated + allocations[ms_id][h_id] <= manufacturing_sites[ms_id]["production_capacity"]:
+                final_allocations[ms_id][h_id] = allocations[ms_id][h_id]
+                total_allocated += allocations[ms_id][h_id]
+            else:
+                remaining_capacity = manufacturing_sites[ms_id]["production_capacity"] - total_allocated
+                if remaining_capacity > 0:
+                    final_allocations[ms_id][h_id] = remaining_capacity
+                    total_allocated += remaining_capacity
+                break
+
+    response_data = {
+        "cost_matrix": cost_matrix,
+        "total_cost": total_cost,
+        "allocations": [
+            {"manufacturing_site": ms, "hospital": h, "quantity": int(final_allocations[ms][h])}
+            for ms in final_allocations for h in final_allocations[ms] if int(final_allocations[ms][h]) > 0
+        ]
+    }
+
+    return JsonResponse(response_data)
+in this orders allocating based on minimun cost, how to inform this allocated orders to manufacture site and hospitals to track order details, start date is providing by admin(midator b/w manufacture site and hospitals)
+now how connect this loop 
+these are manufacture and hospital models
+class Manufacture(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True)
+    site_id = models.CharField(max_length=255, unique=True,  primary_key=True)
+    name = models.CharField(max_length=255)
+    production_capacity = models.IntegerField()
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    street_address = models.CharField(max_length=255)
+    city = models.CharField(max_length=255)
+    state = models.CharField(max_length=255)
+    postal_code = models.CharField(max_length=20)
+    country = models.CharField(max_length=255)
+   
+    
+
+    def __str__(self):
+        return self.name
+class Hospital(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True)
+    hospital_id = models.CharField(max_length=255, unique=True, primary_key=True)
+    hospital_name = models.CharField(max_length=255)
+    hospital_latitude = models.FloatField()
+    hospital_longitude = models.FloatField()
+    street_address = models.CharField(max_length=255)
+    city = models.CharField(max_length=255)
+    state = models.CharField(max_length=255)
+    postal_code = models.CharField(max_length=20)
+    country = models.CharField(max_length=255)
+
+    def __str__(self):
+        return self.hospital_name
